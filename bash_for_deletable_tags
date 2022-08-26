@@ -1,0 +1,13 @@
+bash for deletable tags
+
+
+psudo:
+if tag is help then return not deletable
+
+I'm thinking, based on usage, that I need to check against tag-ref
+Can I just do "help"? or do I have to declare a varriable? or?
+
+
+if [ "$tagref" = "help" ] then
+	return 1
+fi
