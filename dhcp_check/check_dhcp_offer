@@ -1,0 +1,308 @@
+#!/usr/bin/perl -w
+
+use warnings;
+use strict;
+use threads;
+use threads::shared;
+
+use Net::Pcap;
+use Data::Dumper;
+use IO::Socket::INET;
+use Net::DHCP::Packet;
+use Net::DHCP::Constants;
+use Getopt::Long;
+
+$| = 1;    # piping hot pipes
+
+our $expected_server_ip  = "";
+our $expected_lease_time = "";
+our $client_mac;
+our $help;
+our $interface;
+
+GetOptions(
+	'interface=s'  => \$interface,
+	'client-mac=s' => \$client_mac,
+	'server-ip=s'  => \$expected_server_ip,
+	'lease-time=s' => \$expected_lease_time,
+	'h|help|?'     => sub { print_usage(); exit 3 }
+);
+
+if ( !defined($interface) || !defined($client_mac) ) {
+	print_usage();
+	exit 3;
+}
+
+our $return_string        = "";
+our $return_code          = 3;
+our $dhcp_offers_recieved = 0;
+
+my $snaplen   = 1024;     # how many bytes of each packet to record from the capture
+my $promisc   = 1;        # Put the interface in promiscuous mode (to snoop broadcast)
+my $to_ms     = 10000;    # number of miliseconds to capture packets
+                          # for. I'm not quite shure what it does
+my $count     = 2000000;      # number of packets to capture, more than it
+                          # will ever hit.
+my $user_data = "";       # will be passed to function, not much use to us.
+my $err       = "";       # Errors will be sent here.
+my $optimise  = 1;        # optimise
+my $netmask   = '24';     # just get everything
+my $filter_string = 'dst port 68';    # filter out things in the dhcp port range
+my $filter_compiled;                  # compiled filter will be stored here
+my $send_transaction_id = int( rand(0xFFFFFFFF) );    # random transaction id
+share($send_transaction_id);                          # Share this with threads.
+
+# Put the client mac in form NET::DHCP expects
+$client_mac =~ s/://g;
+$client_mac = lc($client_mac);
+share($client_mac);
+
+# convert these to hex
+our $expected_server_ip_hex = lc( ip_to_hex($expected_server_ip) );
+our $expected_lease_time_hex;
+our $send_transaction_id_hex = sprintf( "%08x", $send_transaction_id );
+if ( $expected_lease_time ne "" ) {
+	$expected_lease_time_hex = sprintf( "%x", $expected_lease_time );
+}
+else {
+	$expected_lease_time_hex = "";
+}
+
+my $capture_object =
+  Net::Pcap::open_live( $interface, $snaplen, $promisc, $to_ms, \$err )
+  or die("pcap open live failed: $!\n"); #die "$err";
+
+# compile the filter
+my $return =
+  Net::Pcap::compile( $capture_object, \$filter_compiled, $filter_string,
+	$optimise, $netmask ) or warn("pcap compile failed: $!\n");
+
+if ( $return != 0 ) {
+	print "CRITICAL - Could not compile capture filter";
+	exit 3;
+}
+
+# apply the compiled filter
+$return = Net::Pcap::setfilter( $capture_object, $filter_compiled ) or warn("pcap setfilter failed: $!\n");
+if ( $return != 0 ) {
+	print "CRITICAL - Could not set capture filter";
+	exit 3;
+}
+
+my $dhcp_send_thread = threads->create(
+	sub {
+		# wait a bit for the pcap loop to start
+		sleep 6;
+
+		# creat DHCP Packet
+		my $discover = Net::DHCP::Packet->new(
+			'Xid'   => $send_transaction_id,    # This is a shared variable
+			'Flags' => 0x8000,                  # ask for broadcast answer
+			DHO_DHCP_MESSAGE_TYPE() => DHCPDISCOVER(),
+			'Chaddr'                => $client_mac,
+		) or die "CRITICAL - Could not create dhcp packet $@";
+
+		# prepare packet
+		our $handle = IO::Socket::INET->new(
+			Proto     => 'udp',
+			Broadcast => 1,
+			PeerPort  => '67',
+			LocalPort => '67',
+			PeerAddr  => '255.255.255.255',
+			Blocking  => 0,
+			ReuseAddr => 1,
+		) or die "socket: $@";    # yes, it uses $@ here
+
+		if ( $interface =~ /vlan/ ) {
+
+			# 25 is SO_BINDTODEVICE
+			$handle->sockopt( 25, $interface )
+			  or die "CRITICAL - Could not bind to interface";
+		}
+
+		# send the packet
+		$handle->send( $discover->serialize() )
+		  or die "CRITICAL - Error sending broadcast inform:$!\n";
+
+		close $handle;
+
+	}
+);
+
+# Start the pcap loop. After 10 seconds, kill it, and report the
+# results.
+eval {
+	use POSIX qw(SIGALRM);
+	POSIX::sigaction( SIGALRM,
+		POSIX::SigAction->new(
+			sub {
+				$dhcp_send_thread->join();
+
+				if ( $return_code == 3 ) {
+					print "CRITICAL - Did not recieve DHCPOFFER within 10 sec.";
+					if ( my $err = $dhcp_send_thread->error() ) {
+						print "$err \n";
+					}
+					exit 2;
+				}
+				if ( $dhcp_offers_recieved > 1 ) {
+					print "CRITICAL - Recieved more than one DHCPOFFER ";
+					print $return_string;
+					exit 2;
+				}
+				if ( $return_code == 2 ) {
+					print "CRITICAL - ";
+				}
+				if ( $return_code == 1 ) {
+					print "WARNING - ";
+				}
+				if ( $return_code == 0 ) {
+					print "OK - ";
+				}
+
+				if ( my $err = $dhcp_send_thread->error() ) {
+					print "$err - ";
+				}
+
+				print $return_string;
+
+				print "Recieved $dhcp_offers_recieved DHCP OFFERs";
+
+				exit $return_code;
+			}
+		)
+	) || die "Error setting SIGALRM handler: $!\n";
+
+	alarm 15;    #Wait 15 sec for the correct packet
+
+	$return =
+	  Net::Pcap::loop( $capture_object, $count, \&parse_packet, $user_data ) or warn("pcap loop failed: $!\n");
+	if ( $return != 0 ) {
+		print "pcap loop failed";
+		exit 3;
+	}
+
+	print "CRITICAL - Too many broadcast packets on port 67 (What's going on?)";
+	exit 2;
+
+};
+
+# Parse the sent packet. spec found here:
+# https://en.wikipedia.org/wiki/Dynamic_Host_Configuration_Protocol#DHCP_offer
+# It's not checking all the options, but more checks can be added in the future.
+sub parse_packet {
+	my ( $user_data, $header, $packet ) = @_;
+	my $hex_packet = unpack( 'H*', $packet );
+	my $dest_mac    = substr( $hex_packet, 0,  12 );
+	my $src_mac     = substr( $hex_packet, 12, 12 );    # This had previously been used to confirm the physical address of the responding dhcp server. Not useful anymore (RT-451711)
+	my $type        = substr( $hex_packet, 24, 4 );
+	my $ip_info     = substr( $hex_packet, 28, 40 );    # not really that useful
+	my $src_port    = substr( $hex_packet, 68, 4 );     # remember, in hex
+	my $dst_port    = substr( $hex_packet, 72, 4 );     # ^
+	my $len         = substr( $hex_packet, 76, 4 );
+	my $chk_sum     = substr( $hex_packet, 80, 4 );
+	my $msg_type    = substr( $hex_packet, 84, 2 );
+	my $hw_type     = substr( $hex_packet, 86, 2 );
+	my $hw_addr_len = substr( $hex_packet, 88, 2 );
+	my $hops        = substr( $hex_packet, 90, 2 );
+	my $recv_transaction_id = substr( $hex_packet, 92,  8 );
+	my $sec_elpased         = substr( $hex_packet, 100, 4 );
+	my $offered_ip          = substr( $hex_packet, 116, 8 );
+	my $dhcp_msg_type       = substr( $hex_packet, 564, 2 );
+	my $dhcp_server_ip      = substr( $hex_packet, 574, 8 );
+	my $lease_time          = substr( $hex_packet, 586, 8 );
+
+	return 0    # This is not the packet you are looking for unless...
+	  unless (
+		$msg_type eq "02"                # dhcp reply
+		&& $send_transaction_id_hex eq
+		$recv_transaction_id             # Means it's a response to the request
+	  );
+
+	if (
+		$dhcp_msg_type ne "35"           # dhcp offer code, 53 in base 10
+	  )
+	{
+		$return_string .=
+		    'Incorrect dhcp msg type, got 0x'
+		  . $dhcp_msg_type
+		  . ", expected 0x35; ";
+		$return_code = 2;
+	}
+
+	if (   $expected_server_ip_hex ne ""
+		&& $dhcp_server_ip ne $expected_server_ip_hex )
+	{
+		$return_string .=
+		    "Unexpected src ip with DHCP OFFER: "
+		  . hex_to_ip($dhcp_server_ip)
+		  . ", expected: $expected_server_ip; ";
+		$return_code = 2;
+	}
+
+	$lease_time =~ s/^0*//;    # strip off initial 0s
+	if (   $expected_lease_time_hex ne ""
+		&& $expected_lease_time_hex ne $lease_time )
+	{
+		$return_string .=
+		    "Recieved incorrect lease time. Recieved "
+		  . hex($lease_time)
+		  . ", expected $expected_lease_time; ";
+		$return_code = 1 unless $return_code != 3;
+	}
+
+	if ( $return_code == 3 ) {
+		$return_string .= "Got DHCP offer of " . hex_to_ip($offered_ip) . "; ";
+		$return_code = 0;
+	}
+
+	$dhcp_offers_recieved++;
+
+}
+
+sub ip_to_hex {
+	my $ip = shift;
+	return "" if ( $ip eq "" );
+	my $hex = "";
+	foreach ( split /\./, $ip ) {
+		$hex .= sprintf( "\U%02x", $_ );
+	}
+	return $hex;
+
+}
+
+sub hex_to_ip {
+	my $ip = shift;
+	return "" if ( $ip eq "" );
+	return
+	    hex( substr( $ip, 0, 2 ) ) . "."
+	  . hex( substr( $ip, 2, 2 ) ) . "."
+	  . hex( substr( $ip, 4, 2 ) ) . "."
+	  . hex( substr( $ip, 6, 2 ) );
+}
+
+sub print_usage {
+	print '
+Usage: 
+./check_dhcp_offer --interface INTERFACE --client-mac CLIENT_MAC [OPTIONS]
+    
+--interface INTERFACE
+   The interface to check. Can be a raw interface (eth0) or a vlan (vlan200)
+
+--client-mac MAC_ADDRESS
+    The mac address from which to send the packet. 
+    Must be in form ff:ff:ff:ff:ff:ff
+
+--server-ip IP
+    Return 2 unless the source ip of the dhcp offer is IP
+
+--server-mac MAC_ADDR
+    Return 2 unless the source mac address of the dhcp offer is MAC_ADDR
+
+--lease-time 
+    Return 1 unless the lease time in the dhcp offer is SEC
+
+-h --help -?
+    Print this help text
+'
+}
