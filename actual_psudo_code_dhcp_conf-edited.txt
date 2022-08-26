@@ -1,0 +1,71 @@
+ip -4 addr show -> get all interfaces/vlans on this machine (I think) then take the ip from the inet lines of what is returned and store it
+connect to database
+-----
+open file dhcpd.conf
+write header using vars: this_server, default_domain, default_netbios_server
+for each host:
+	if has name:
+		write name, check if invalid name
+	else if has ip_address:
+		unpack and write ip_address
+	else:
+		write ethernet
+	if host seen add more on so unique fqdn
+	mark host as seen
+	if host should be configed and ip_address exists:
+		write fixed address
+	if ethernet exists and mac isn't multicast:
+		write hardware ethernet
+	if name exits:
+		write option host-name
+	write option domain-name
+	if host not category1:
+		search domain gets all search domains (from domain_name and adds engr if cae)
+		write option list domain-search
+	else:
+		write category1
+	write option ip netbios-name-servers
+	write option ip log-servers
+	write option bootfile-name
+	write option boot-size
+	write option root-path
+	write option tftp-server-name
+	if dhcp_vendor exists:
+		write vendor-encapsulated-options
+	if dhcp_vendor_class exists:
+		write vendor-class-identifier
+	if next_bootstrap_server exists:
+		write next-server
+for each subnet:
+	skip if in 127.0.0.0
+	if subnet is secondary:
+		write that we'll get to it when hit primary
+	else:
+		write subnet head
+		if this subnet has secondary subnets:
+			write shared-network
+			mark that this network as shared
+		else:
+			write subnet
+			write server-identifier
+			write option routers
+			write dynamic range
+		write domain-name-servers
+		if name_server_2 exists:
+			write another domain-name-server
+		write default-lease-time
+		write max-lease-time
+		if secondary_subnet exists:
+			write server-identifier
+			write subnet
+			write routers
+			write dynamic range
+			while there are more secondary subnets:
+				pop
+				write subnet
+				write routers
+				if pooled_lease_period exists:
+					write it
+				write dynamic range
+write footer
+exit

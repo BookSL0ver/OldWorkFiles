@@ -1,0 +1,67 @@
+#!/bin/bash
+set -x -e
+
+#get the lines, using uname -r and file, and sed to get the number from file
+file_command=file -L /srv/tftp/debian/vmlinuz
+file_kernel=$(sed -n "s/^.*version \([^ ]\+-amd64\).*$/\1/p" <<< $file_command)
+#file_kernel=4.19.0-14-amd64
+echo $file_kernel
+machine_kernel=uname -r #pretty sure this gives the higher number
+#machine_kernel=4.19.0-14-amd64
+echo $machine_kernel
+
+#get each number and difs
+fk_1=$(sed -n "s/^\([0-9]\+\).*$/\1/p" <<< $file_kernel)
+fk_2=$(sed -n "s/^[0-9]\+\.\([0-9]\+\).*$/\1/p" <<< $file_kernel)
+fk_3=$(sed -n "s/^[0-9]\+\.[0-9]\+\.\([0-9]\+\).*$/\1/p" <<< $file_kernel)
+fk_4=$(sed -n "s/^[0-9]\+\.[0-9]\+\.[0-9]\+\-\([0-9]\+\).*$/\1/p" <<< $file_kernel
+echo $fk_4
+mk_1=$(sed -n "s/^\([0-9]\+\).*$/\1/p" <<< $machine_kernel)
+mk_2=$(sed -n "s/^[0-9]\+\.\([0-9]\+\).*$/\1/p" <<< $machine_kernel)
+mk_3=$(sed -n "s/^[0-9]\+\.[0-9]\+\.\([0-9]\+\).*$/\1/p" <<< $machine_kernel)
+mk_4=$(sed -n "s/^[0-9]\+\.[0-9]\+\.[0-9]\+\-\([0-9]\+\).*$/\1/p" <<< $machine_kernel
+echo $mk_4
+dif1=$((mk_1-fk_1))
+dif2=$((mk_2-fk_2))
+dif3=$((mk_3-fk_3))
+dif4=$((mk_4-fk_4))
+echo dif1
+echo dif2
+echo dif3
+echo dif4
+
+#set all the values (ie 3 unknown, 2 crit, 1 warn, 0 ok)
+OK=0
+WARNING=1
+CRITICAL=2
+UNKNOWN=3
+
+#check each thing, starting with if they're all equal (which is ok), then going from highest num to lowest num, all if one off critical except lowest, which warns one off and is critical any more than that
+if [[ $fk_1 -eq $mk_1 ]] && [[ $fk_2 -eq $mk_2 ]] && [[ $fk_3 -eq $mk_3 ]] && [[ $fk_4 -eq $mk_4 ]]
+then
+	echo $OK
+	#exit $OK
+elif [[ $dif1 -gt 0 ]]
+then
+	echo $CRITICAL
+	#exit $CRITICAL
+elif [[ $dif2 -gt 0 ]]
+then
+	echo $CRITICAL
+	#exit $CRITICAL
+elif [[ $dif3 -gt 0 ]]
+then
+	echo $CRITICAL
+	#exit $CRITICAL
+elif [[ $dif4 -eq 1 ]]
+then
+	echo $WARNING
+	#exit $WARNING
+elif [[ $dif4 -gt 1 ]]
+then
+	echo $CRITICAL
+	#exit $CRITICAL
+else
+	echo $UNKNOWN
+	#exit $UNKNOWN
+fi

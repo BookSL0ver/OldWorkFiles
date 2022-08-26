@@ -1,0 +1,107 @@
+package main
+
+import (
+	"domain.com"
+	"domain2.com"
+//	"domain3.com"
+	"fmt"
+	"strconv"
+	"encoding/base64"
+	"regexp"
+	"net/url"
+//	"crypto/tls"
+	"encoding/xml"
+)
+import soap "github.com/hooklift/gowsdl/soap"
+
+type SOAPHeader struct {
+	XMLName xml.Name `xml:"http://schemas.xmlsoap.org/soap/envelope/ Header"`
+	Content interface{} `xml:",omitempty"`
+}
+
+type WSSSecurityHeader struct {
+	XMLName		xml.Name	`xml:"wsse:Security"`
+	XmlNSWsse	string		`xml:"xmlns:wsse,attr"`
+	XmlNSWsu	string		`xml:"xmlns:wsu,attr"`
+	Data		string		`xml:",innerxml"`
+}
+
+func NewWSSSecurityHeader(token string) *WSSSecurityHeader {
+	hdr := &WSSSecurityHeader{XmlNSWsse: soap.WssNsWSSE, XmlNSWsu: soap.WssNsWSU, Data: token}
+	return hdr;
+}
+
+func main() {
+	//create mip instance
+//	mipclient := soap.NewClient("domain4.com", soap.WithTLS(&tls.Config{InsecureSkipVerify: true}))
+	mipclient := soap.NewClient("domain5.com")
+	fmt.Println("0")
+	service := caeauth.NewCAEAuthService(mipclient)
+	fmt.Println("1")
+	var username caeauth.CaeloginType
+	username = "sometest"
+	var password caeauth.PasswordType
+	password = "superfunwebservicetesting"
+	samlToken, err := service.GetSAMLTokenFromUsernamePassword(&caeauth.GetSAMLTokenFromUsernamePasswordRequest{Loginname: &username, Password: &password, Application: "go-caeauth",})
+	fmt.Println("2")
+	if err != nil {
+		fmt.Println("ERROR: " + err.Error())
+	}
+	decodedOutput, err := base64.StdEncoding.DecodeString(samlToken.SAMLToken)
+	if err != nil {
+		fmt.Println("ERROR: " + err.Error())
+	}
+	fmt.Println("3")
+	urldecodedOutput, err := url.QueryUnescape(string(decodedOutput))
+	if err != nil {
+		fmt.Println("ERROR: " + err.Error())
+	}
+	fmt.Println("4")
+	reg := regexp.MustCompile(`\<\?xml.*\?\>\n`)
+	fmt.Println("5")
+	token := reg.ReplaceAllString(urldecodedOutput,"")
+	fmt.Println("Token: " + token)
+	fmt.Println("SamlToken: " + samlToken.SAMLToken)
+//	myheader := cmd.SOAPHeader{Content: cmd.NewWSSSecurityHeader(token)}
+	myheader := SOAPHeader{Content: NewWSSSecurityHeader(samlToken.SAMLToken)}					//TODO possibly this?
+//	fmt.Println("SamlToken: " + samlToken.SAMLToken)
+//	myheader := cmd.SOAPHeader{Content: cmd.NewWSSSecurityHeader(samlToken.SAMLToken)}
+	fmt.Println("SoapHeader: " + myheader.XMLName.Local + myheader.XMLName.Space)
+	fmt.Println("6")
+	mipclient.AddHeader(myheader)									//TODO or this?
+	fmt.Println("7")
+	mip := caemip.NewManageip(mipclient)								//TODO or this?
+	fmt.Println("8")
+
+	//call GetDNSDomains
+	var stringlist []string
+	stringlist = append(stringlist, "Forward")
+	fmt.Println("9")
+	domains_list, err := mip.GetDNSDomains(&caemip.GetDNSDomainsRequest{Domain_type: stringlist})	//TODO or this? this throws the err
+	fmt.Println("10")
+	if err != nil {
+		fmt.Println("ERROR: " + err.Error())
+	}
+	fmt.Println("10.5")
+	//see what the qualification and the full domain name are
+	dl := domains_list.Dns_domain									//TODO this throws the panic seg error
+	fmt.Println("11")
+	for index, domain := range dl {
+		fmt.Println(strconv.Itoa(index) + ": ")
+		fmt.Println("\tQualification: " + domain.Domain_qualification)
+		fmt.Println("\tFull name: " + domain.Full_domain_name)
+		fmt.Println("\tDomain Name Key: " + domain.Domain_name_key)
+	}
+	fmt.Println("12")
+
+
+
+	//call getdhcphost
+	host_list, err := mip.GetDHCPHosts(&caemip.GetDHCPHostsRequest{})
+	fmt.Println("13")
+	if err != nil {
+		fmt.Println("ERROR: " + err.Error())
+	}
+	fmt.Println("\nHost Domain Name: " + host_list.Dhcp_host[0].Ip_device.Domain_name)
+	fmt.Println("END")
+}

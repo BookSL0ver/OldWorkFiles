@@ -1,0 +1,466 @@
+package main
+
+import (
+	"os"
+	"fmt"
+//	"github.com/hooklift/gowsdl/soap"
+	"strings"
+	"regexp"
+//	"github.com/spf13/cobra"
+	"git.cae.wisc.edu/caesoapapis-go/caeauth"
+	"git.cae.wisc.edu/caesoapapis-go/caemip"
+	"strconv"
+//	"git.cae.wisc.edu/cae-manageip-go-client/cmd"		//TODO yells because it can't find git.cae.wisc.edu/cae-manageip-go-client/soaputil, which I agree doesn't seem to exist so...
+)
+import soap "github.com/hooklift/gowsdl/soap"
+//import caesoaputil "git.cae.wisc.edu/cae-manageip-go-client/soaputil"
+
+var (
+	hosts map[string]mip.DHCPHost = make(map[string]mip.DHCPHost)
+	subnets map[int64]mip.DHCPSubnet = make(map[int64]mip.DHCPSubnet)
+	domain_names map[string]string = make(map[string]string)
+	dynamic_range map[int64]int64 = make(map[int64]int64)				//TODO check types(there isn't a mip call for this yet)
+	host_seen map[string]int = make(map[string]int)
+	mip mip.Manageip
+	DEFAULT_DOMAIN string = "domain.com"
+	DEFAULT_NETBIOS_NAME_SERVER string = "<IP_ADDR>"
+	THIS_SERVER string = "<IP_ADDR"
+	uniq_splitting_val string = "\t"
+	my_ips map[int]int = make(map[int]int)						//TODO need to figure out types for this, currently just a guess
+)
+
+func main() {
+	// Do I need this?
+/*	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Username: ")
+	usr, _ := strings.TrimSpace(reader.ReadString('\n'))
+	fmt.Print("Password: ")
+	bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
+	fmt.Println()
+	if err != nil {
+		//error checking
+	}
+	pswrd := strings.TrimSpace(string(bytePassword))
+*/
+	//make a manageip instance to use for the mip calls
+
+	// from login example
+	mipclient := soap.NewClient("domain.com")
+	service := auth.NewAuthService(mipclient)
+	var username auth.loginType
+	username = "test"				//TODO change into non-test un & pass
+	var password auth.PasswordType
+	password = "testing"
+	samlToken, err := service.GetSAMLTokenFromUsernamePassword(&auth.GetSAMLTokenFromUsernamePasswordRequest{Loginname: &username, Password: &password, Application: "app",})
+
+	//from getbuildings example
+//	samlToken := caesoaputil.Login("sometest", "superfunwebservicetesting")		//change into non-test un & pass
+//	mipclient := soap.NewClient("https://engr-ws-dev.cae.wisc.edu:844/manageip-ws-endpoint/endpoint-1.0")
+	myheader := SOAPHeader{Content: NewWSSSecurityHeader(samlToken)}		//TODO but this doesn't work without cae-manageip-go-client so that needs to be solved
+	mipclient.AddHeader(myheader)
+	//TODO error checking
+
+	mip := caemip.NewManageip(mipclient)				//need to give a *soap.Client, returns a Manageip instance (which is basically a pointer to manageip)
+
+
+	get_my_ips()
+	get_subnets()
+	get_domains()
+	get_hosts()
+//	get_hosts_without_address()
+	write_config()
+}
+
+
+func unpack_ip(ip int64) string {					//DONE
+	//from the go playground:
+	return fmt.Sprintf("%d.%d.%d.%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip))
+}
+
+/*func pack_ip(ip string) (ip_int uint32) {				//DONE but unsure if I actually need this, doesn't appear to be used anywhere
+	//from the go playground:
+	ip_byte := net.ParseIP(ip).To4()
+	for i := 0; i < len(ip_byte); i++ {
+		ip_int |= uint32(ip_byte[i])
+		if i < 3 {
+			ip_int <<= 8
+		}
+	}
+	return
+}*/
+
+func unpack_ethernet_address(high, low int64) string {			//DONE
+	return fmt.Sprintf("%2.2X:%2.2X:%2.2X:%2.2X:%2.2X:%2.2X",
+		(high >>  8) & 255,
+		(high	   ) & 255,
+		(low  >> 24) & 255,
+		(low  >> 16) & 255,
+		(low  >>  8) & 255,
+		(low	   ) & 255)
+}
+
+func write_config() {
+	//open config file
+	file, err := os.Create("/etc/dhcp/dhcpd.conf")			//TODO need to check if this is right
+	if err != nil {
+		//TODO error checking
+	}
+	defer file.Close()
+	//put header on file
+
+	if err != nil {
+		//TODO error checking
+	}
+
+	regex_non_white, err := regexp.Compile("\\S")
+
+//	var this_host
+	for this_host, _ := range hosts {
+		bytes, err := file.WriteString(host_config(this_host, 1))
+		//TODO error checking
+	}
+
+//	var this_subnet
+	for this_subnet, _ := range subnets {
+		// do not generate for subnets in 127.0.0.0
+		if this_subnet >= 2130706432 && this_subnet < 2147483647 {
+			continue
+		}
+
+		bytes, err := file.WriteString("\n")
+		bytes, err = file.WriteString("###############################################\n")
+		bytes, err = file.WriteString("### subnet" + unpack_ip(int64(this_subnet)) + "\n")
+		bytes, err = file.WriteString("###############################################\n\n")
+		//TODO error checking
+
+		this_is_a_shared_network := 0
+		if subnets[this_subnet].Subnet.Secondary_ipv4_subnets != nil && len(subnets[this_subnet].Subnet.Secondary_ipv4_subnets) > 0 {
+			bytes, err := file.WriteString("# This is a shared network\n")
+			bytes, err = file.WriteString("shared-network " + unpack_ip(int64(this_subnet)) + "-shared {\n")
+			this_is_a_shared_network = 1
+			//TODO error checking
+		} else {
+			bytes, err := file.WriteString("subnet " + unpack_ip(int64(this_subnet)) + " netmask " + unpack_ip(subnets[this_subnet].Subnet.Ipv4_mask.Numeric32) + " {\n")
+			bytes, err = file.WriteString("\tserver-identifier " + get_server_identifier_for_subnet(unpack_ip(int64(this_subnet)), unpack_ip(subnets[this_subnet].Subnet.Ipv4_mask.Numeric32)) + ";\n")
+			bytes, err = file.WriteString("\toption routers " + unpack_ip(subnets[this_subnet].Subnet.Ipv4_router.Numeric32) + ";\n")
+			//TODO error chekcing
+
+			range_str := get_dynamic_range(int64(this_subnet))
+			//if range_str has non-whitespace chars, then put a tab at the beg of it
+			if regex_non_white.MatchString(range_str) {			//not sure if right type (supposed to be byte[])
+				range_str = "\t" + range_str
+			}
+			bytes, err = file.WriteString(range_str)
+			//TODO error checking
+		}
+		bytes, err = file.WriteString("\toption domain-name-servers " + unpack_ip(subnets[this_subnet].Subnet.Name_server1.Numeric32))
+		if subnets[this_subnet].Subnet.Name_server2.Ip_address != "" {
+			bytes, err := file.WriteString(", " + unpack_ip(subnets[this_subnet].Subnet.Name_server2.Numeric32))
+			//TODO error checking
+		}
+		bytes, err = file.WriteString(";\n")
+		bytes, err = file.WriteString("\tdefault-lease-time " + strconv.FormatInt(int64(subnets[this_subnet].Subnet.Static_lease_period), 10) + ";\n")
+		bytes, err = file.WriteString("\tmax-lease-time " + strconv.FormatInt(int64(subnets[this_subnet].Subnet.Static_lease_period), 10) + ";\n")
+		//TODO error checking
+
+		if this_is_a_shared_network == 1 {				//I think this will work? maybe? idk it's the same if statement as before, when this was set
+			bytes, err := file.WriteString("\tserver-identifier " + get_server_identifier_for_subnet(unpack_ip(int64(this_subnet)), unpack_ip(subnets[this_subnet].Subnet.Ipv4_mask.Numeric32)) + ";\n")
+			bytes, err = file.WriteString("\tsubnet " + unpack_ip(int64(this_subnet)) + " netmask " + unpack_ip(subnets[this_subnet].Subnet.Ipv4_mask.Numeric32) + " {\n")
+			bytes, err = file.WriteString("\t\toption routers " + unpack_ip(int64(this_subnet)) + " netmask " + unpack_ip(subnets[this_subnet].Subnet.Ipv4_router.Numeric32) + ";\n")
+			//TODO error checking
+
+			range_str := get_dynamic_range(int64(this_subnet))
+			//if range_str has any non-whitespace chars, then put two tabs in front of it
+			if regex_non_white.MatchString(range_str) {
+				range_str = "\t\t" + range_str
+			}
+			bytes, err = file.WriteString(range_str)
+			bytes, err = file.WriteString("\t} # /subnet " + unpack_ip(int64(this_subnet)) + "\n")
+			//TODO error checking
+
+			for b := 0; b < len(subnets[this_subnet].Subnet.Secondary_ipv4_subnets); b++ {
+				this_secondary := subnets[this_subnet].Subnet.Secondary_ipv4_subnets[b].Ipv4_address_low.Numeric32
+				bytes, err := file.WriteString("\tsubnet " + unpack_ip(int64(this_secondary)) + " netmask " + unpack_ip(subnets[this_secondary].Subnet.Ipv4_mask.Numeric32) + " {\n")
+				bytes, err = file.WriteString("\t\toption routers " + unpack_ip(subnets[this_secondary].Subnet.Ipv4_router.Numeric32) + ";\n")
+				//TODO error checking
+
+				if subnets[this_secondary].Subnet.Dynamic_lease_period != 0 {
+					subnets[this_secondary].Subnet.Dynamic_lease_period = subnets[this_subnet].Subnet.Dynamic_lease_period
+				}
+
+				range_str := get_dynamic_range(int64(this_secondary))
+				//if range_str has any non-whitespace chars, then put two tabs at the beg of it
+				if regex_non_white.MatchString(range_str) {
+					range_str = "\t\t" + range_str
+				}
+				bytes, err = file.WriteString(range_str)
+				bytes, err = file.WriteString("\t} # /subnet " + unpack_ip(int64(this_subnet)) + "\n\n")
+				//TODO error checking
+			}
+			bytes, err = file.WriteString("} # /shared-network " + unpack_ip(int64(this_subnet)) + "-shared\n")
+			//TODO error checking
+		} else {
+			bytes, err := file.WriteString("} # /subnet " + unpack_ip(int64(this_subnet)) + "\n\n")
+			//TODO error checking
+		}
+	}
+
+	bytes, err = file.WriteString(`CONF_FOOTER
+	on commit {
+		set ClientLease = binary-to-ascii (10, 32, \"\", encode-int (lease-time, 32));
+		set ClientIP	= binary-to-ascii (10, 8, \".\", leased-address);
+		set ClientMac	= concat (
+			suffix (concat (\"0\", binary-to-ascii (16, 8, \"\", substring (hardware, 1, 1))), 2), \":\",
+			suffix (concat (\"0\", binary-to-ascii (16, 8, \"\", substring (hardware, 2, 1))), 2), \":\",
+			suffix (concat (\"0\", binary-to-ascii (16, 8, \"\", substring (hardware, 3, 1))), 2), \":\",
+			suffix (concat (\"0\", binary-to-ascii (16, 8, \"\", substring (hardware, 4, 1))), 2), \":\",
+			suffix (concat (\"0\", binary-to-ascii (16, 8, \"\", substring (hardware, 5, 1))), 2), \":\",
+			suffix (concat (\"0\", binary-to-ascii (16, 8, \"\", substring (hardware, 6, 1))), 2)
+		)
+		if (static) {
+			log (info, concat (
+				\"DHCPNETMON \", ClientLease, \" \", ClientMac, \" \", ClinetIP, \" \",
+				pick-first-value(host-decl-name, \"(none)\"),
+				\" static \"
+			))
+		} else {
+			log (info, concat (
+				\"DHCPNETMON \", ClientLease, \" \", ClientMac, \" \", ClientIP, \" \",
+				pick-first-value(ddns-fwd-name, \"(none)\"),
+				\" dynamic\"
+			))
+		}
+	}
+	CONF_FOOTER`)
+	if err != nil {
+		//TODO error checking
+	}
+}
+
+func host_config(host_id string, should_config_ip int) string {
+	hostDomain := domain_names[hosts[host_id].Ip_device.Domain_name]
+	FQDN := ""
+	hostFQDN := ""
+	if hosts[host_id].Ip_device.Name != ""{						//TODO I don't know what the if here is, this is just a guess
+		FQDN += hosts[host_id].Ip_device.Name						//same
+		FQDN += "."
+		FQDN += hostDomain
+		//replace all non-letter, number, or -_. characters with INVALID
+		regex_non_letnum, err := regexp.Compile("[^A-Za-z0-9-_.]")
+		FQDN = regex_non_letnum.ReplaceAllString(FQDN, "")					//TODO don't know what the eqivalent value to INVALID in this instance would be
+		hostFQDN = FQDN
+	} else if len(hosts[host_id].Static_ipv4_addresses) > 0 {
+		FQDN += unpack_ip(hosts[host_id].Static_ipv4_addresses.Ip_address)
+	} else {
+		dyneth := unpack_ethernet_address(hosts[host_id].Ip_device.Ethernet_address.Numeric/4294967296, hosts[host_id].Ip_device.Ethernet_address.Numeric%4294967296)
+		//replace all : in dyneth with -
+		dyneth = strings.Replace(dyneth, ":", "-", -1)
+		FQDN += "dynamic-host-" + dyneth
+	}
+	if host_seen[FQDN] > 0 {
+		FQDN = unpack_ip(hosts[host_id].Static_ipv4_addresses.Ip_address) + "." + FQDN
+	}
+
+	host_seen[FQDN] = 1
+
+	ret := "host " + FQDN + " {\n"
+	if should_config_ip == 1 && hosts[host_id].Static_ipv4_addresses.Ip_address > 0 {
+		ret += "\tfixed-address "
+		ret += unpack_ip(hosts[host_id].Static_ipv4_addresses.Ip_address + ";\n")
+	}
+	if hosts[host_id].Ip_device.Ethernet_address.Numeric != 0 { //&& {		//TODO what? mac_is_multicast?  also not sure if what I have rn is right or not
+		ret += "\thardware ethernet "
+		ret += unpack_ethernet_address(hosts[host_id].Ip_device.Ethernet_address.Numeric/4294967296, hosts[host_id].Ip_device.Ethernet_address.Numeric%4294967296)
+		ret += ";\n"
+	}
+	if hosts[host_id].Ip_device.Name != "" {					//I think?
+		ret += add_option("host-name", hostFQDN, "\"")
+	}
+
+	var domain_name string
+	if hosts[host_id].Ip_device.Domain_name != "" {
+		domain_name := hosts[host_id].Ip_device.Domain_name
+	} else {
+		domain_name := hostDomain
+	}
+	ret += add_option("domain_name", domain_name, "\"")
+
+	if true{						//TODO what is category1? it doesn't seem to corelate with any info I have. Maybe look on that app that shows the tables?
+		//list search_domains = split domain_name by a regex into a list of arguments
+		regex_split, err := regexp.Compile("(,\\s*|\\s+)")
+		search_domains := regex_split.Split(domain_name, -1)				//I think?
+		if hostDomain == "cae.wisc.edu" {
+			//TODO push?
+		}
+		//TODO push?
+		ret += add_option_list("domain-search", "\"", search_domains)
+	} else {
+		//ret += "\t# Category1 == " + hosts[host_id]					//TODO category1 again. could it be omitCaenn?
+	}
+
+	ret += add_option_ip("netbios-name-servers", hosts[host_id].Dhcp_info.Netbios_name_server.Numeric32)
+	ret += add_option_ip("log-servers", hosts[host_id].Dhcp_info.Syslog_server.Numeric32)
+	ret += add_option("bootfile-name", hosts[host_id].Dhcp_info.Boot_file, "\"")
+	ret += add_option("boot-size", hosts[host_id], "")						//TODO bootfile size doesn't appear to be in the manage ip?
+	ret += add_option("root-path", hosts[host_id], "\"")						//TODO root path doesn't appear to exist either
+	ret += add_option("tftp-server-name", hosts[host_id].Dhcp_info.Tftp_server, "\"")
+
+	if hosts[host_id].Dhcp_info.Dhcp_vendor_opts != nil {				//TODO idk if this is the right thing to check?
+		temp_split := hosts[host_id].Dhcp_info.Dhcp_vendor_opts
+		//put a : between every two chars
+		split := ""
+		for index, letter := range temp_split {
+			split += string(letter)
+			if index % 2 != 0 {
+				split += ":"
+			}
+		}
+		//find :$ and replace it with nothing
+		split = strings.Replace(split, ":$", "", -1)
+		ret += "\toption vendor-encapsulated-options " + split +";\n"
+	}
+	if hosts[host_id].Dhcp_info.Dhcp_vendor_class != "" {
+		ret += "\toption vendor-class-identifier \"" + hosts[host_id].Dhcp_info.Dhcp_vendor_class + "\";\n"
+	}
+	if hosts[host_id].Dhcp_info.Next_bootstrap_server != nil {
+		ret += "\tnext-server " + unpack_ip(hosts[host_id].Dhcp_info.Next_bootstrap_server.Numeric32) + ";\n"
+	}
+	ret += "}\n"
+
+	return ret
+}
+
+func add_option(option, value, quotes string) string {
+	if value != "" {
+		//find all \$ and replace it with nothing
+		value = strings.Replace(value, "\\$", "", -1)
+		return "\toption " + option + " " + quotes + value + quotes + ";\n"
+	}
+	return ""
+}
+
+func add_option_list(option, quotes string, values []string) string {
+	if len(values) <= 0 {
+		return ""
+	}
+	str := "\toption " + option + " "
+	regex_aol, err := regexp.Compile("^\\s*[,]?\\s*$")
+	for _, value := range values {
+		if value != "" && !regex_aol.MatchString(value) {
+			//find all \$ and replace it with nothing
+			value = strings.Replace(value, "\\$", "", -1)
+			str += quotes + value + quotes + ", "
+		}
+	}
+	//find first , $ and replace it with ;\n
+	str = strings.Replace(str, ", $", ";\n", 1)
+	return str
+}
+
+func add_option_ip(option string, value int64) string {
+	if value > 0 {
+		return "\toption " + option + " " + unpack_ip(value) + ";\n"
+	}
+	return ""
+}
+
+func get_subnets() {
+	subnets_list, err := mip.GetDHCPSubnets(&caemip.GetDHCPSubnetsRequest{})		//takes GetDHCPSubnetsRequest, gives GetDHCPSubnetsResponse
+	//TODO error checking
+	//	for index, value = range subnets_list {						//not sure if this will work? I might need to do something different to the Response (could be true whenever I get a response from mip)
+	for a := 0; a < len(subnets_list.Dhcp_subnet); a++ {
+		subnets[subnets_list.Dhcp_subnet[a].Subnet.Ipv4_address_low.Numeric32] = *(subnets_list.Dhcp_subnet[a])
+	}
+}
+
+/*I don't think I need this, as the mip call doesn't really use the by subnet thing
+func get_hosts() {
+	for key, _ := range subnets {
+		get_hosts_from_subnet(key)
+	}
+}*/
+
+func get_hosts() {
+	host_list, err := mip.GetDHCPHosts(&caemip.GetDHCPHostsRequest{})			//takes GetDHCPHostsRequest, gives GetDHCPHostsResponse
+	//TODO error checking
+	//	for index, value = range host_list {						//same as subnets, not sure if this will work without other analysis of the host_list
+	for i := 0; i < len(host_list.Dhcp_host); i++ {
+		hostid := make_hostid(host_list.Dhcp_host[i].Ip_device.Name, host_list.Dhcp_host[i].Ip_device.Domain_name, host_list.Dhcp_host[i].Ip_device.Ethernet_address.Numeric/4294967296, host_list.Dhcp_host[i].Ip_device.Ethernet_address.Numeric%4294967296)
+		hosts[hostid] = *host_list.Dhcp_host[i]
+	}
+}
+
+//TODO 
+//func max_ip		only used in get_hosts_from_subnet, can I get rid of it?
+//func min_ip		same
+func get_domains() {	//TODO drews said that this comes from the getDNSDomains mip call, but I am unsure as to which parameters match up to what I need
+	var stringlist []string
+	stringlist[0] = "Forward"
+	domains, err := mip.GetDNSDomains(&caemip.GetDNSDomainsRequest{Domain_type: stringlist})
+	//TODO error checking
+}
+
+func get_dynamic_range(this_subnet int64) string {
+	if dynamic_range[this_subnet] <= 0 {
+		return ""
+	}
+	//var this_range
+	ret := "pool {\n"
+	if subnets[this_subnet].Subnet.Unknown_ethernet_ok {
+	} else {
+		ret += "\tdeny unknown-clients;\n"
+	}
+	for this_range, _ := range dynamic_range {					//TODO check if this is actually what that foreach loop means
+		ret += "\trange " + unpack_ip(this_range)
+		if this_range != dynamic_range[this_subnet] {				//TODO still need to finish this statement, but there is currently no mip call for this so...
+			ret += " " + unpack_ip(dynamic_range[this_subnet])		//TODO same
+		}
+		ret += ";\n"
+	}
+	ret += "\tdefault-lease-time " + string(subnets[this_subnet].Subnet.Dynamic_lease_period) + ";\n"
+	ret += "\tmax-lease-time " + string(subnets[this_subnet].Subnet.Dynamic_lease_period) + ";\n"
+	ret += "}\n"
+	return ret
+}
+
+func make_hostid(name, domain_name string, ethernet_high, ethernet_low int64) string {
+	var retval string
+	if name == "" {
+		name = "NULL"			//I'm assuming this should be null b/c some other program needs it, b/c otherwise I don't think it would be in quotes (I could be wrong)
+	}
+	if domain_name == "" {
+		domain_name = "NULL"		//same
+	}
+	retval = name + uniq_splitting_val + domain_name + uniq_splitting_val + string(ethernet_high) + uniq_splitting_val + string(ethernet_low)
+	offset := 1
+	if (caemip.DHCPHost{}) == hosts[retval] {
+		for hosts[retval + uniq_splitting_val + string(offset)] != nil {
+			offset++
+		}
+		retval += uniq_splitting_val + string(offset)
+	}
+	return retval
+}
+
+//TODO
+func get_my_ips() {				//used only for func below
+}
+
+func get_server_identifier_for_subnet(subnet, mask string) string {			//TODO used in write config, need to figure out types
+//func get_server_identifier_for_subnet() string {
+	server_identifier := THIS_SERVER
+	var server_ids []string								//TODO declare this as a array? list? something else? pushes things into it
+	for address, _ := range my_ips {
+//		if ipv4_in_network() {							//TODO checks if (subnet with mask) contains (address with 255.255.255.255 as a mask)
+//			server_ids = append(s, address)
+//		}
+	}
+	if len(server_ids) == 1 {							//TODO not sure if that's right or not
+		server_identifier = server_ids[0]
+	}
+	// else, default to the ip helper address (even for the 13 subnet where we have tow addresses)
+	return server_identifier
+}
+
+
+// END SUBS
